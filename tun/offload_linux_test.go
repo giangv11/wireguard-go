@@ -28,6 +28,71 @@ var (
 	ip6PortC = netip.MustParseAddrPort("[2001:db8::3]:1")
 )
 
+func udp4PacketMutateIPFields(srcIPPort, dstIPPort netip.AddrPort, payloadLen int, ipFn func(*header.IPv4Fields)) []byte {
+	totalLen := 28 + payloadLen
+	b := make([]byte, offset+int(totalLen), 65535)
+	ipv4H := header.IPv4(b[offset:])
+	srcAs4 := srcIPPort.Addr().As4()
+	dstAs4 := dstIPPort.Addr().As4()
+	ipFields := &header.IPv4Fields{
+		SrcAddr:     tcpip.AddrFromSlice(srcAs4[:]),
+		DstAddr:     tcpip.AddrFromSlice(dstAs4[:]),
+		Protocol:    unix.IPPROTO_UDP,
+		TTL:         64,
+		TotalLength: uint16(totalLen),
+	}
+	if ipFn != nil {
+		ipFn(ipFields)
+	}
+	ipv4H.Encode(ipFields)
+	udpH := header.UDP(b[offset+20:])
+	udpH.Encode(&header.UDPFields{
+		SrcPort: srcIPPort.Port(),
+		DstPort: dstIPPort.Port(),
+		Length:  uint16(payloadLen + udphLen),
+	})
+	ipv4H.SetChecksum(^ipv4H.CalculateChecksum())
+	pseudoCsum := header.PseudoHeaderChecksum(unix.IPPROTO_UDP, ipv4H.SourceAddress(), ipv4H.DestinationAddress(), uint16(udphLen+payloadLen))
+	udpH.SetChecksum(^udpH.CalculateChecksum(pseudoCsum))
+	return b
+}
+
+func udp6Packet(srcIPPort, dstIPPort netip.AddrPort, payloadLen int) []byte {
+	return udp6PacketMutateIPFields(srcIPPort, dstIPPort, payloadLen, nil)
+}
+
+func udp6PacketMutateIPFields(srcIPPort, dstIPPort netip.AddrPort, payloadLen int, ipFn func(*header.IPv6Fields)) []byte {
+	totalLen := 48 + payloadLen
+	b := make([]byte, offset+int(totalLen), 65535)
+	ipv6H := header.IPv6(b[offset:])
+	srcAs16 := srcIPPort.Addr().As16()
+	dstAs16 := dstIPPort.Addr().As16()
+	ipFields := &header.IPv6Fields{
+		SrcAddr:           tcpip.AddrFromSlice(srcAs16[:]),
+		DstAddr:           tcpip.AddrFromSlice(dstAs16[:]),
+		TransportProtocol: unix.IPPROTO_UDP,
+		HopLimit:          64,
+		PayloadLength:     uint16(payloadLen + udphLen),
+	}
+	if ipFn != nil {
+		ipFn(ipFields)
+	}
+	ipv6H.Encode(ipFields)
+	udpH := header.UDP(b[offset+40:])
+	udpH.Encode(&header.UDPFields{
+		SrcPort: srcIPPort.Port(),
+		DstPort: dstIPPort.Port(),
+		Length:  uint16(payloadLen + udphLen),
+	})
+	pseudoCsum := header.PseudoHeaderChecksum(unix.IPPROTO_UDP, ipv6H.SourceAddress(), ipv6H.DestinationAddress(), uint16(udphLen+payloadLen))
+	udpH.SetChecksum(^udpH.CalculateChecksum(pseudoCsum))
+	return b
+}
+
+func udp4Packet(srcIPPort, dstIPPort netip.AddrPort, payloadLen int) []byte {
+	return udp4PacketMutateIPFields(srcIPPort, dstIPPort, payloadLen, nil)
+}
+
 func tcp4PacketMutateIPFields(srcIPPort, dstIPPort netip.AddrPort, flags header.TCPFlags, segmentSize, seq uint32, ipFn func(*header.IPv4Fields)) []byte {
 	totalLen := 40 + segmentSize
 	b := make([]byte, offset+int(totalLen), 65535)
@@ -137,6 +202,34 @@ func Test_handleVirtioRead(t *testing.T) {
 			[]int{160, 160},
 			false,
 		},
+		{
+			"udp4",
+			virtioNetHdr{
+				flags:      unix.VIRTIO_NET_HDR_F_NEEDS_CSUM,
+				gsoType:    unix.VIRTIO_NET_HDR_GSO_UDP_L4,
+				gsoSize:    100,
+				hdrLen:     28,
+				csumStart:  20,
+				csumOffset: 6,
+			},
+			udp4Packet(ip4PortA, ip4PortB, 200),
+			[]int{128, 128},
+			false,
+		},
+		{
+			"udp6",
+			virtioNetHdr{
+				flags:      unix.VIRTIO_NET_HDR_F_NEEDS_CSUM,
+				gsoType:    unix.VIRTIO_NET_HDR_GSO_UDP_L4,
+				gsoSize:    100,
+				hdrLen:     48,
+				csumStart:  40,
+				csumOffset: 6,
+			},
+			udp6Packet(ip6PortA, ip6PortB, 200),
+			[]int{148, 148},
+			false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -173,6 +266,13 @@ func flipTCP4Checksum(b []byte) []byte {
 	return b
 }
 
+func flipUDP4Checksum(b []byte) []byte {
+	at := virtioNetHdrLen + 20 + 6 // 20 byte ipv4 header; udp csum offset is 6
+	b[at] ^= 0xFF
+	b[at+1] ^= 0xFF
+	return b
+}
+
 func Fuzz_handleGRO(f *testing.F) {
 	pkt0 := tcp4Packet(ip4PortA, ip4PortB, header.TCPFlagAck, 100, 1)
 	pkt1 := tcp4Packet(ip4PortA, ip4PortB, header.TCPFlagAck, 100, 101)
@@ -180,11 +280,17 @@ func Fuzz_handleGRO(f *testing.F) {
 	pkt3 := tcp6Packet(ip6PortA, ip6PortB, header.TCPFlagAck, 100, 1)
 	pkt4 := tcp6Packet(ip6PortA, ip6PortB, header.TCPFlagAck, 100, 101)
 	pkt5 := tcp6Packet(ip6PortA, ip6PortC, header.TCPFlagAck, 100, 201)
-	f.Add(pkt0, pkt1, pkt2, pkt3, pkt4, pkt5, offset)
-	f.Fuzz(func(t *testing.T, pkt0, pkt1, pkt2, pkt3, pkt4, pkt5 []byte, offset int) {
-		pkts := [][]byte{pkt0, pkt1, pkt2, pkt3, pkt4, pkt5}
+	pkt6 := udp4Packet(ip4PortA, ip4PortB, 100)
+	pkt7 := udp4Packet(ip4PortA, ip4PortB, 100)
+	pkt8 := udp4Packet(ip4PortA, ip4PortC, 100)
+	pkt9 := udp6Packet(ip6PortA, ip6PortB, 100)
+	pkt10 := udp6Packet(ip6PortA, ip6PortB, 100)
+	pkt11 := udp6Packet(ip6PortA, ip6PortC, 100)
+	f.Add(pkt0, pkt1, pkt2, pkt3, pkt4, pkt5, pkt6, pkt7, pkt8, pkt9, pkt10, pkt11, offset)
+	f.Fuzz(func(t *testing.T, pkt0, pkt1, pkt2, pkt3, pkt4, pkt5, pkt6, pkt7, pkt8, pkt9, pkt10, pkt11 []byte, offset int) {
+		pkts := [][]byte{pkt0, pkt1, pkt2, pkt3, pkt4, pkt5, pkt6, pkt7, pkt8, pkt9, pkt10, pkt11}
 		toWrite := make([]int, 0, len(pkts))
-		handleGRO(pkts, offset, newTCPGROTable(), newTCPGROTable(), &toWrite)
+		handleGRO(pkts, offset, newTCPGROTable(), newUDPGROTable(), &toWrite)
 		if len(toWrite) > len(pkts) {
 			t.Errorf("len(toWrite): %d > len(pkts): %d", len(toWrite), len(pkts))
 		}
@@ -210,17 +316,22 @@ func Test_handleGRO(t *testing.T) {
 		wantErr     bool
 	}{
 		{
-			"multiple flows",
+			"multiple protocols and flows",
 			[][]byte{
-				tcp4Packet(ip4PortA, ip4PortB, header.TCPFlagAck, 100, 1),   // v4 flow 1
-				tcp4Packet(ip4PortA, ip4PortB, header.TCPFlagAck, 100, 101), // v4 flow 1
-				tcp4Packet(ip4PortA, ip4PortC, header.TCPFlagAck, 100, 201), // v4 flow 2
-				tcp6Packet(ip6PortA, ip6PortB, header.TCPFlagAck, 100, 1),   // v6 flow 1
-				tcp6Packet(ip6PortA, ip6PortB, header.TCPFlagAck, 100, 101), // v6 flow 1
-				tcp6Packet(ip6PortA, ip6PortC, header.TCPFlagAck, 100, 201), // v6 flow 2
+				tcp4Packet(ip4PortA, ip4PortB, header.TCPFlagAck, 100, 1),   // tcp4 flow 1
+				udp4Packet(ip4PortA, ip4PortB, 100),                         // udp4 flow 1
+				udp4Packet(ip4PortA, ip4PortC, 100),                         // udp4 flow 2
+				tcp4Packet(ip4PortA, ip4PortB, header.TCPFlagAck, 100, 101), // tcp4 flow 1
+				tcp4Packet(ip4PortA, ip4PortC, header.TCPFlagAck, 100, 201), // tcp4 flow 2
+				tcp6Packet(ip6PortA, ip6PortB, header.TCPFlagAck, 100, 1),   // tcp6 flow 1
+				tcp6Packet(ip6PortA, ip6PortB, header.TCPFlagAck, 100, 101), // tcp6 flow 1
+				tcp6Packet(ip6PortA, ip6PortC, header.TCPFlagAck, 100, 201), // tcp6 flow 2
+				udp4Packet(ip4PortA, ip4PortB, 100),                         // udp4 flow 1
+				udp6Packet(ip6PortA, ip6PortB, 100),                         // udp6 flow 1
+				udp6Packet(ip6PortA, ip6PortB, 100),                         // udp6 flow 1
 			},
-			[]int{0, 2, 3, 5},
-			[]int{240, 140, 260, 160},
+			[]int{0, 1, 2, 4, 5, 7, 9},
+			[]int{240, 228, 128, 140, 260, 160, 248},
 			false,
 		},
 		{
@@ -245,9 +356,12 @@ func Test_handleGRO(t *testing.T) {
 				flipTCP4Checksum(tcp4Packet(ip4PortA, ip4PortB, header.TCPFlagAck, 100, 1)), // v4 flow 1 seq 1 len 100
 				tcp4Packet(ip4PortA, ip4PortB, header.TCPFlagAck, 100, 101),                 // v4 flow 1 seq 101 len 100
 				tcp4Packet(ip4PortA, ip4PortB, header.TCPFlagAck, 100, 201),                 // v4 flow 1 seq 201 len 100
+				flipUDP4Checksum(udp4Packet(ip4PortA, ip4PortB, 100)),
+				udp4Packet(ip4PortA, ip4PortB, 100),
+				udp4Packet(ip4PortA, ip4PortB, 100),
 			},
-			[]int{0, 1},
-			[]int{140, 240},
+			[]int{0, 1, 3, 4},
+			[]int{140, 240, 128, 228},
 			false,
 		},
 		{
@@ -262,75 +376,99 @@ func Test_handleGRO(t *testing.T) {
 			false,
 		},
 		{
-			"tcp4 unequal TTL",
+			"unequal TTL",
 			[][]byte{
 				tcp4Packet(ip4PortA, ip4PortB, header.TCPFlagAck, 100, 1),
 				tcp4PacketMutateIPFields(ip4PortA, ip4PortB, header.TCPFlagAck, 100, 101, func(fields *header.IPv4Fields) {
 					fields.TTL++
 				}),
+				udp4Packet(ip4PortA, ip4PortB, 100),
+				udp4PacketMutateIPFields(ip4PortA, ip4PortB, 100, func(fields *header.IPv4Fields) {
+					fields.TTL++
+				}),
 			},
-			[]int{0, 1},
-			[]int{140, 140},
+			[]int{0, 1, 2, 3},
+			[]int{140, 140, 128, 128},
 			false,
 		},
 		{
-			"tcp4 unequal ToS",
+			"unequal ToS",
 			[][]byte{
 				tcp4Packet(ip4PortA, ip4PortB, header.TCPFlagAck, 100, 1),
 				tcp4PacketMutateIPFields(ip4PortA, ip4PortB, header.TCPFlagAck, 100, 101, func(fields *header.IPv4Fields) {
 					fields.TOS++
 				}),
+				udp4Packet(ip4PortA, ip4PortB, 100),
+				udp4PacketMutateIPFields(ip4PortA, ip4PortB, 100, func(fields *header.IPv4Fields) {
+					fields.TOS++
+				}),
 			},
-			[]int{0, 1},
-			[]int{140, 140},
+			[]int{0, 1, 2, 3},
+			[]int{140, 140, 128, 128},
 			false,
 		},
 		{
-			"tcp4 unequal flags more fragments set",
+			"unequal flags more fragments set",
 			[][]byte{
 				tcp4Packet(ip4PortA, ip4PortB, header.TCPFlagAck, 100, 1),
 				tcp4PacketMutateIPFields(ip4PortA, ip4PortB, header.TCPFlagAck, 100, 101, func(fields *header.IPv4Fields) {
 					fields.Flags = 1
 				}),
+				udp4Packet(ip4PortA, ip4PortB, 100),
+				udp4PacketMutateIPFields(ip4PortA, ip4PortB, 100, func(fields *header.IPv4Fields) {
+					fields.Flags = 1
+				}),
 			},
-			[]int{0, 1},
-			[]int{140, 140},
+			[]int{0, 1, 2, 3},
+			[]int{140, 140, 128, 128},
 			false,
 		},
 		{
-			"tcp4 unequal flags DF set",
+			"unequal flags DF set",
 			[][]byte{
 				tcp4Packet(ip4PortA, ip4PortB, header.TCPFlagAck, 100, 1),
 				tcp4PacketMutateIPFields(ip4PortA, ip4PortB, header.TCPFlagAck, 100, 101, func(fields *header.IPv4Fields) {
 					fields.Flags = 2
 				}),
+				udp4Packet(ip4PortA, ip4PortB, 100),
+				udp4PacketMutateIPFields(ip4PortA, ip4PortB, 100, func(fields *header.IPv4Fields) {
+					fields.Flags = 2
+				}),
 			},
-			[]int{0, 1},
-			[]int{140, 140},
+			[]int{0, 1, 2, 3},
+			[]int{140, 140, 128, 128},
 			false,
 		},
 		{
-			"tcp6 unequal hop limit",
+			"ipv6 unequal hop limit",
 			[][]byte{
 				tcp6Packet(ip6PortA, ip6PortB, header.TCPFlagAck, 100, 1),
 				tcp6PacketMutateIPFields(ip6PortA, ip6PortB, header.TCPFlagAck, 100, 101, func(fields *header.IPv6Fields) {
 					fields.HopLimit++
 				}),
+				udp6Packet(ip6PortA, ip6PortB, 100),
+				udp6PacketMutateIPFields(ip6PortA, ip6PortB, 100, func(fields *header.IPv6Fields) {
+					fields.HopLimit++
+				}),
 			},
-			[]int{0, 1},
-			[]int{160, 160},
+			[]int{0, 1, 2, 3},
+			[]int{160, 160, 148, 148},
 			false,
 		},
 		{
-			"tcp6 unequal traffic class",
+			"ipv6 unequal traffic class",
 			[][]byte{
 				tcp6Packet(ip6PortA, ip6PortB, header.TCPFlagAck, 100, 1),
 				tcp6PacketMutateIPFields(ip6PortA, ip6PortB, header.TCPFlagAck, 100, 101, func(fields *header.IPv6Fields) {
 					fields.TrafficClass++
 				}),
+				udp6Packet(ip6PortA, ip6PortB, 100),
+				udp6PacketMutateIPFields(ip6PortA, ip6PortB, 100, func(fields *header.IPv6Fields) {
+					fields.TrafficClass++
+				}),
 			},
-			[]int{0, 1},
-			[]int{160, 160},
+			[]int{0, 1, 2, 3},
+			[]int{160, 160, 148, 148},
 			false,
 		},
 	}
@@ -338,7 +476,7 @@ func Test_handleGRO(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			toWrite := make([]int, 0, len(tt.pktsIn))
-			err := handleGRO(tt.pktsIn, offset, newTCPGROTable(), newTCPGROTable(), &toWrite)
+			err := handleGRO(tt.pktsIn, offset, newTCPGROTable(), newUDPGROTable(), &toWrite)
 			if err != nil {
 				if tt.wantErr {
 					return
@@ -360,51 +498,198 @@ func Test_handleGRO(t *testing.T) {
 	}
 }
 
-func Test_isTCP4NoIPOptions(t *testing.T) {
-	valid := tcp4Packet(ip4PortA, ip4PortB, header.TCPFlagAck, 100, 1)[virtioNetHdrLen:]
-	invalidLen := valid[:39]
-	invalidHeaderLen := make([]byte, len(valid))
-	copy(invalidHeaderLen, valid)
-	invalidHeaderLen[0] = 0x46
-	invalidProtocol := make([]byte, len(valid))
-	copy(invalidProtocol, valid)
-	invalidProtocol[9] = unix.IPPROTO_TCP + 1
+func Test_packetIsGROCandidate(t *testing.T) {
+	tcp4 := tcp4Packet(ip4PortA, ip4PortB, header.TCPFlagAck, 100, 1)[virtioNetHdrLen:]
+	tcp4TooShort := tcp4[:39]
+	ip4InvalidHeaderLen := make([]byte, len(tcp4))
+	copy(ip4InvalidHeaderLen, tcp4)
+	ip4InvalidHeaderLen[0] = 0x46
+	ip4InvalidProtocol := make([]byte, len(tcp4))
+	copy(ip4InvalidProtocol, tcp4)
+	ip4InvalidProtocol[9] = unix.IPPROTO_GRE
+
+	tcp6 := tcp6Packet(ip6PortA, ip6PortB, header.TCPFlagAck, 100, 1)[virtioNetHdrLen:]
+	tcp6TooShort := tcp6[:59]
+	ip6InvalidProtocol := make([]byte, len(tcp6))
+	copy(ip6InvalidProtocol, tcp6)
+	ip6InvalidProtocol[6] = unix.IPPROTO_GRE
+
+	udp4 := udp4Packet(ip4PortA, ip4PortB, 100)[virtioNetHdrLen:]
+	udp4TooShort := udp4[:27]
+
+	udp6 := udp6Packet(ip6PortA, ip6PortB, 100)[virtioNetHdrLen:]
+	udp6TooShort := udp6[:47]
 
 	tests := []struct {
 		name string
 		b    []byte
-		want bool
+		want groCandidateType
 	}{
 		{
-			"valid",
-			valid,
-			true,
+			"tcp4",
+			tcp4,
+			tcp4GROCandidate,
 		},
 		{
-			"invalid length",
-			invalidLen,
-			false,
+			"tcp6",
+			tcp6,
+			tcp6GROCandidate,
 		},
 		{
-			"invalid version",
+			"udp4",
+			udp4,
+			udp4GROCandidate,
+		},
+		{
+			"udp6",
+			udp6,
+			udp6GROCandidate,
+		},
+		{
+			"udp4 too short",
+			udp4TooShort,
+			notGROCandidate,
+		},
+		{
+			"udp6 too short",
+			udp6TooShort,
+			notGROCandidate,
+		},
+		{
+			"tcp4 too short",
+			tcp4TooShort,
+			notGROCandidate,
+		},
+		{
+			"tcp6 too short",
+			tcp6TooShort,
+			notGROCandidate,
+		},
+		{
+			"invalid IP version",
 			[]byte{0x00},
-			false,
+			notGROCandidate,
 		},
 		{
-			"invalid header len",
-			invalidHeaderLen,
-			false,
+			"invalid IP header len",
+			ip4InvalidHeaderLen,
+			notGROCandidate,
 		},
 		{
-			"invalid protocol",
-			invalidProtocol,
-			false,
+			"ip4 invalid protocol",
+			ip4InvalidProtocol,
+			notGROCandidate,
+		},
+		{
+			"ip6 invalid protocol",
+			ip6InvalidProtocol,
+			notGROCandidate,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := isTCP4NoIPOptions(tt.b); got != tt.want {
-				t.Errorf("isTCP4NoIPOptions() = %v, want %v", got, tt.want)
+			if got := packetIsGROCandidate(tt.b); got != tt.want {
+				t.Errorf("packetIsGROCandidate() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_udpPacketsCanCoalesce(t *testing.T) {
+	udp4a := udp4Packet(ip4PortA, ip4PortB, 100)
+	udp4b := udp4Packet(ip4PortA, ip4PortB, 100)
+	udp4c := udp4Packet(ip4PortA, ip4PortB, 110)
+
+	type args struct {
+		pkt        []byte
+		iphLen     uint8
+		gsoSize    uint16
+		item       udpGROItem
+		bufs       [][]byte
+		bufsOffset int
+	}
+	tests := []struct {
+		name string
+		args args
+		want canCoalesce
+	}{
+		{
+			"coalesceAppend equal gso",
+			args{
+				pkt:     udp4a[offset:],
+				iphLen:  20,
+				gsoSize: 100,
+				item: udpGROItem{
+					gsoSize: 100,
+					iphLen:  20,
+				},
+				bufs: [][]byte{
+					udp4a,
+					udp4b,
+				},
+				bufsOffset: offset,
+			},
+			coalesceAppend,
+		},
+		{
+			"coalesceAppend smaller gso",
+			args{
+				pkt:     udp4a[offset : len(udp4a)-90],
+				iphLen:  20,
+				gsoSize: 10,
+				item: udpGROItem{
+					gsoSize: 100,
+					iphLen:  20,
+				},
+				bufs: [][]byte{
+					udp4a,
+					udp4b,
+				},
+				bufsOffset: offset,
+			},
+			coalesceAppend,
+		},
+		{
+			"coalesceUnavailable smaller gso previously appended",
+			args{
+				pkt:     udp4a[offset:],
+				iphLen:  20,
+				gsoSize: 100,
+				item: udpGROItem{
+					gsoSize: 100,
+					iphLen:  20,
+				},
+				bufs: [][]byte{
+					udp4c,
+					udp4b,
+				},
+				bufsOffset: offset,
+			},
+			coalesceUnavailable,
+		},
+		{
+			"coalesceUnavailable larger following smaller",
+			args{
+				pkt:     udp4c[offset:],
+				iphLen:  20,
+				gsoSize: 110,
+				item: udpGROItem{
+					gsoSize: 100,
+					iphLen:  20,
+				},
+				bufs: [][]byte{
+					udp4a,
+					udp4c,
+				},
+				bufsOffset: offset,
+			},
+			coalesceUnavailable,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := udpPacketsCanCoalesce(tt.args.pkt, tt.args.iphLen, tt.args.gsoSize, tt.args.item, tt.args.bufs, tt.args.bufsOffset); got != tt.want {
+				t.Errorf("udpPacketsCanCoalesce() = %v, want %v", got, tt.want)
 			}
 		})
 	}
