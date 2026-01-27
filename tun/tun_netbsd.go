@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: MIT
  *
- * Copyright (C)2017  - 2026-01 WireGuard Giang V. All Rights Reserved.
+ * Copyright (C) 2017-2023 WireGuard LLC. All Rights Reserved.
  */
-//-------Giang V------------------
+
 package tun
 
 import (
@@ -144,6 +144,7 @@ func CreateTUN(name string, mtu int) (Device, error) {
 		tunfile.Close()
 		return nil, fmt.Errorf("Unable to put into multi-af mode: %v", errno)
 	}
+
 
 	if err == nil && name == "tun" {
 		fname := os.Getenv("WG_TUN_NAME_FILE")

@@ -3,14 +3,12 @@
  * Copyright (C) 2017-2023 WireGuard LLC. All Rights Reserved.
  */
 
-//Project description
-
 package device
 
 import (
 	"errors"
 
-	"github.com/giangv11/wireguard-go/conn"
+	"github.com/tailscale/wireguard-go/conn"
 )
 
 type DummyDatagram struct {

@@ -8,13 +8,11 @@ package device
 import (
 	"container/list"
 	"errors"
-	"net/netip"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/giangv11/wireguard-go/conn"
+	"github.com/tailscale/wireguard-go/conn"
 )
 
 type Peer struct {
@@ -26,12 +24,6 @@ type Peer struct {
 	txBytes           atomic.Uint64  // bytes send to peer (endpoint)
 	rxBytes           atomic.Uint64  // bytes received from peer
 	lastHandshakeNano atomic.Int64   // nano seconds since epoch
-
-	// deleteOnIdle indicates whether the peer should be deleted when idle
-	// because it was auto-created via a Device.PeerLookupFunc.
-	//
-	// This field should only be set once, before the peer is started.
-	deleteOnIdle bool
 
 	endpoint struct {
 		sync.Mutex
@@ -52,9 +44,7 @@ type Peer struct {
 	}
 
 	state struct {
-		sync.Mutex // protects against concurrent Start/Stop, and fields below
-
-		allowedIPs []netip.Prefix
+		sync.Mutex // protects against concurrent Start/Stop
 	}
 
 	queue struct {
@@ -97,7 +87,7 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	// map public key
 	_, ok := device.peers.keyMap[pk]
 	if ok {
-		return nil, errAddExistingPeer
+		return nil, errors.New("adding existing peer")
 	}
 
 	// pre-compute DH
@@ -121,22 +111,6 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	device.peers.keyMap[pk] = peer
 
 	return peer, nil
-}
-
-// SetAllowedIPs sets the allowed IP prefixes for this peer.
-//
-// If the allowedIPs are unchanged since the last call, this method is a no-op.
-// It's the caller's responsibility to ensure that no two peers have duplicate
-// allowed IPs. If so, the last writer wins.
-func (p *Peer) SetAllowedIPs(allowedIPs []netip.Prefix) {
-	p.state.Lock()
-	defer p.state.Unlock()
-
-	if slices.Equal(p.state.allowedIPs, allowedIPs) {
-		return
-	}
-	p.device.allowedips.setPeerPrefixes(p, allowedIPs)
-	p.state.allowedIPs = slices.Clone(allowedIPs) // avoid retaining caller's slice
 }
 
 // SendBuffers sends buffers to peer. WireGuard packet data in each element of
