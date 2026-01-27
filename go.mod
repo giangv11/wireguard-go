@@ -1,6 +1,6 @@
 module github.com/tailscale/wireguard-go
 
-go 1.20
+go 1.25
 
 require (
 	golang.org/x/crypto v0.13.0
@@ -11,6 +11,7 @@ require (
 )
 
 require (
+	github.com/giangv11/wireguard-go v0.0.0-20260127201830-816b4fcaf13e // indirect
 	github.com/google/btree v1.0.1 // indirect
 	golang.org/x/time v0.0.0-20220210224613-90d013bbcef8 // indirect
 )
